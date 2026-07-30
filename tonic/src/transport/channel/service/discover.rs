@@ -60,7 +60,15 @@ impl<K: Hash + Eq + Clone> Stream for DynamicServiceStream<K> {
             Poll::Pending | Poll::Ready(None) => Poll::Pending,
             Poll::Ready(Some(change)) => match change {
                 Change::Insert(k, endpoint) => {
-                    let connection = Connection::lazy(endpoint.http_connector(), endpoint);
+                    // An endpoint naming an experimental transport type is
+                    // connected through the registered builder; selection
+                    // stays fail-closed (an unregistered type makes this
+                    // connection error on use, never fall back to HTTP/2).
+                    let connection = if endpoint.transport_type.is_some() {
+                        Connection::custom_lazy(endpoint)
+                    } else {
+                        Connection::lazy(endpoint.http_connector(), endpoint)
+                    };
                     Poll::Ready(Some(Ok(TowerChange::Insert(k, connection))))
                 }
                 Change::Remove(k) => Poll::Ready(Some(Ok(TowerChange::Remove(k)))),

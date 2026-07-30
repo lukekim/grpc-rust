@@ -212,6 +212,35 @@ impl Channel {
         Ok(Channel { svc })
     }
 
+    /// Connect eagerly over an experimental pluggable transport selected by
+    /// `Endpoint::transport_type` (fail-closed if the type is unregistered).
+    pub(crate) async fn connect_custom(endpoint: Endpoint) -> Result<Self, super::Error> {
+        let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
+        let executor = endpoint.executor.clone();
+
+        let svc = Connection::custom_connect(endpoint)
+            .await
+            .map_err(super::Error::from_source)?;
+        let (svc, worker) = Buffer::pair(svc, buffer_size);
+        executor.execute(worker);
+
+        Ok(Channel { svc })
+    }
+
+    /// Lazily connect over an experimental pluggable transport selected by
+    /// `Endpoint::transport_type`. Fail-closed selection surfaces on the
+    /// first request rather than here (this constructor cannot fail).
+    pub(crate) fn custom_lazy(endpoint: Endpoint) -> Self {
+        let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
+        let executor = endpoint.executor.clone();
+
+        let svc = Connection::custom_lazy(endpoint);
+        let (svc, worker) = Buffer::pair(svc, buffer_size);
+        executor.execute(worker);
+
+        Channel { svc }
+    }
+
     pub(crate) fn balance<D, E>(discover: D, buffer_size: usize, executor: E) -> Self
     where
         D: Discover<Service = Connection> + Unpin + Send + 'static,

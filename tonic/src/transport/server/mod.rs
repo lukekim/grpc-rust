@@ -1141,6 +1141,77 @@ impl<L> Router<L> {
     }
 }
 
+#[cfg(feature = "router")]
+impl Router<Identity> {
+    /// Consume this [`Router`], serving its routes over the EXPERIMENTAL
+    /// pluggable transport registered under `transport_type`, bound at
+    /// `target` (the transport defines the target syntax).
+    ///
+    /// Selection is fail-closed: an unregistered `transport_type` is an
+    /// error before anything is bound — symmetric with the client-side
+    /// selection by [`Endpoint::transport_type`], a tagged listener can
+    /// never silently fall back to the HTTP/2 server path.
+    ///
+    /// The [`Server`] settings that apply above the transport seam are
+    /// honored (`timeout` is enforced per request together with the client's
+    /// `grpc-timeout` header); settings tied to TCP or HTTP/2 are ignored,
+    /// and `max_concurrent_streams` plus the initial stream window are
+    /// passed to the transport as hints. A server with TLS configured is
+    /// reported to the transport, which must fail closed if it cannot
+    /// provide transport security.
+    ///
+    /// This method is only available on a [`Router`] without a custom layer
+    /// stack: layered services cannot cross the transport seam.
+    ///
+    /// # Stability
+    ///
+    /// EXPERIMENTAL: see [`transport::experimental`](crate::transport::experimental).
+    ///
+    /// [`Endpoint::transport_type`]: crate::transport::Endpoint::transport_type
+    pub async fn serve_with_transport_type(
+        self,
+        transport_type: &str,
+        target: &str,
+    ) -> Result<(), super::Error> {
+        self.serve_with_transport_type_shutdown(transport_type, target, std::future::pending())
+            .await
+    }
+
+    /// Like [`Router::serve_with_transport_type`], shutting down gracefully
+    /// when `signal` resolves.
+    pub async fn serve_with_transport_type_shutdown(
+        self,
+        transport_type: &str,
+        target: &str,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), super::Error> {
+        let opts = crate::transport::experimental::server::ServerBuildOptions {
+            max_concurrent_streams: self.server.max_concurrent_streams,
+            init_stream_window_size: self.server.init_stream_window_size,
+            tls_configured: {
+                #[cfg(feature = "_tls-any")]
+                {
+                    self.server.tls.is_some()
+                }
+                #[cfg(not(feature = "_tls-any"))]
+                {
+                    false
+                }
+            },
+        };
+        crate::transport::experimental::server::serve_routes(
+            transport_type,
+            target,
+            self.routes,
+            opts,
+            self.server.timeout,
+            signal,
+        )
+        .await
+        .map_err(super::Error::from_source)
+    }
+}
+
 impl<L> fmt::Debug for Server<L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Builder").finish()

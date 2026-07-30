@@ -131,6 +131,48 @@ impl Connection {
     {
         Self::new(connector, endpoint, true)
     }
+
+    /// Builds a connection over an experimental pluggable transport selected
+    /// by `Endpoint::transport_type`. The per-endpoint layer stack and the
+    /// reconnect machinery are identical to the default HTTP/2 path; only
+    /// the innermost make-service differs (it consults the experimental
+    /// client transport registry, fail-closed, on every connection attempt).
+    fn custom(endpoint: Endpoint, is_lazy: bool) -> Self {
+        let transport_type = endpoint
+            .transport_type
+            .clone()
+            .expect("Connection::custom requires a transport type");
+        let opts = endpoint.experimental_build_options();
+
+        let stack = ServiceBuilder::new()
+            .layer_fn(|s| {
+                let origin = endpoint.origin.as_ref().unwrap_or(endpoint.uri()).clone();
+
+                AddOrigin::new(s, origin)
+            })
+            .layer_fn(|s| UserAgent::new(s, endpoint.user_agent.clone()))
+            .layer_fn(|s| GrpcTimeout::new(s, endpoint.timeout))
+            .option_layer(endpoint.concurrency_limit.map(ConcurrencyLimitLayer::new))
+            .option_layer(endpoint.rate_limit.map(|(l, d)| RateLimitLayer::new(l, d)))
+            .into_inner();
+
+        let make_service =
+            crate::transport::experimental::client::MakeCustomTransport::new(transport_type, opts);
+
+        let conn = Reconnect::new(make_service, endpoint.uri().clone(), is_lazy);
+
+        Self {
+            inner: BoxService::new(stack.layer(conn)),
+        }
+    }
+
+    pub(crate) async fn custom_connect(endpoint: Endpoint) -> Result<Self, crate::BoxError> {
+        Self::custom(endpoint, false).ready_oneshot().await
+    }
+
+    pub(crate) fn custom_lazy(endpoint: Endpoint) -> Self {
+        Self::custom(endpoint, true)
+    }
 }
 
 impl Service<Request<Body>> for Connection {
