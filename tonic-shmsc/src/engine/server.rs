@@ -22,7 +22,7 @@ use super::conn::{
     BodyEvent, CloseReason, Config, ConnIo, RecvCredit, SendWindow, ShmBody, SpinBudget,
     WriteHandle, WriteOp, read_frame, server_handshake, writer_loop,
 };
-use super::frame::{self, FLAG_ACK, FLAG_END_STREAM, Frame, FrameType, ProtocolError, RstCode};
+use super::frame::{self, FLAG_END_STREAM, Frame, FrameType, ProtocolError, RstCode};
 use super::ring::{Consumer, Producer};
 
 /// How long a dialer may take to complete the segment handshake.
@@ -157,10 +157,10 @@ fn peer_info(sock: &Conduit) -> ShmscConnectInfo {
 /// invoke RPCs. This is the authoritative owner-only boundary; the socket mode
 /// is defense-in-depth. Fails closed if the peer uid cannot be determined.
 #[cfg(unix)]
-fn peer_authorized(sock: &Conduit) -> bool {
+fn same_uid(info: &ShmscConnectInfo) -> bool {
     // SAFETY: geteuid is always safe and never fails.
     let me = unsafe { libc::geteuid() };
-    matches!(peer_info(sock).peer_uid, Some(uid) if uid == me)
+    matches!(info.peer_uid, Some(uid) if uid == me)
 }
 
 /// The platform accept source: a bound Unix listener, or the named-pipe
@@ -207,12 +207,10 @@ pub(crate) struct ShmscListener {
     cfg: Config,
     /// (dev, ino) of the socket we bound, so cleanup only ever removes *our*
     /// socket — never a replacement listener's that rebound the same path.
+    /// `serve` sets this to `None` after its explicit unlink so `Drop` becomes a
+    /// no-op and cannot delete a replacement bound during our drain.
     #[cfg(unix)]
     sock_id: Option<(u64, u64)>,
-    /// Cleared once `serve` has done its explicit unlink, so `Drop` does not
-    /// unlink a second time and delete a replacement bound during our drain.
-    #[cfg(unix)]
-    cleanup: bool,
 }
 
 impl std::fmt::Debug for ShmscListener {
@@ -271,7 +269,6 @@ impl ShmscListener {
             path: path.to_owned(),
             cfg,
             sock_id,
-            cleanup: true,
         })
     }
 
@@ -326,11 +323,13 @@ impl ShmscListener {
             tokio::select! {
                 accepted = acceptor.accept() => {
                     let sock = accepted?;
-                    // Authorize the peer (same uid) before creating or passing a
-                    // segment — this closes the bind→chmod authorization race,
-                    // regardless of the socket's transient permissions.
+                    // Identify the peer once (run_conn also stores this in the
+                    // request extensions), and authorize it (same uid) before
+                    // creating or passing a segment — closing the bind→chmod
+                    // race regardless of the socket's transient permissions.
+                    let info = peer_info(&sock);
                     #[cfg(unix)]
-                    if !peer_authorized(&sock) {
+                    if !same_uid(&info) {
                         tracing::debug!("shmsc: refused connection from a different uid");
                         continue;
                     }
@@ -340,7 +339,7 @@ impl ShmscListener {
                     conn_tasks.spawn(async move {
                         match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake(&sock, &cfg)).await {
                             Ok(Ok(seg)) => {
-                                run_conn(sock, seg, cfg, svc, state).await;
+                                run_conn(sock, seg, cfg, svc, state, info).await;
                             }
                             Ok(Err(e)) => {
                                 tracing::debug!("shmsc handshake failed: {e}");
@@ -360,12 +359,12 @@ impl ShmscListener {
         state.begin_drain();
         drop(acceptor);
         // Unlink our socket (only if the path still resolves to it) and disarm
-        // the Drop cleanup, so a replacement listener that rebinds the path
-        // while we drain is never deleted by this listener's teardown.
+        // the Drop cleanup (sock_id -> None), so a replacement listener that
+        // rebinds the path while we drain is never deleted by this teardown.
         #[cfg(unix)]
         {
             unlink_if_ours(&self.path, self.sock_id);
-            self.cleanup = false;
+            self.sock_id = None;
         }
         while conn_tasks.join_next().await.is_some() {}
         Ok(())
@@ -375,11 +374,10 @@ impl ShmscListener {
 #[cfg(unix)]
 impl Drop for ShmscListener {
     fn drop(&mut self) {
-        // Only if `serve` did not already unlink, and only if the path still
-        // resolves to *our* socket (never a replacement's).
-        if self.cleanup {
-            unlink_if_ours(&self.path, self.sock_id);
-        }
+        // No-op if `serve` already unlinked (sock_id is None); otherwise removes
+        // the path only if it still resolves to *our* socket, never a
+        // replacement's.
+        unlink_if_ours(&self.path, self.sock_id);
     }
 }
 
@@ -399,12 +397,7 @@ fn sock_ident(path: &Path) -> Option<(u64, u64)> {
 /// teardown.
 #[cfg(unix)]
 fn unlink_if_ours(path: &Path, id: Option<(u64, u64)>) {
-    use std::os::unix::fs::MetadataExt;
-    if let Some((dev, ino)) = id
-        && let Ok(m) = std::fs::symlink_metadata(path)
-        && m.dev() == dev
-        && m.ino() == ino
-    {
+    if id.is_some() && sock_ident(path) == id {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -464,8 +457,12 @@ struct ServerConn {
     io: Arc<ConnIo>,
     write: WriteHandle,
     streams: std::sync::Mutex<HashMap<u32, ServerEntry>>,
-    /// Highest stream id accepted so far (for GOAWAY).
+    /// Highest stream id ACCEPTED so far — reported in GOAWAY.
     last_accepted: AtomicU32,
+    /// Highest stream id OBSERVED so far (accepted OR refused) — the monotonic
+    /// id invariant is checked against this, so a refused id can never be reused
+    /// or undercut once capacity frees up.
+    last_seen: AtomicU32,
     draining: AtomicBool,
     goaway_sent: AtomicBool,
     active: AtomicUsize,
@@ -526,12 +523,32 @@ impl ServerConn {
     }
 
     fn finish_stream(&self, id: u32) {
-        let removed = self.streams.lock().unwrap().remove(&id);
-        if removed.is_some() {
-            let left = self.active.fetch_sub(1, Ordering::AcqRel) - 1;
-            if left == 0 {
-                self.drained.notify_waiters();
-            }
+        if self.streams.lock().unwrap().remove(&id).is_some() {
+            self.on_stream_removed();
+        }
+    }
+
+    /// Accounts for one stream leaving the table: the single owner of the
+    /// `active` decrement + drained-notify, so the count that the admission gate
+    /// and the drain both read can never drift from the map.
+    fn on_stream_removed(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) - 1 == 0 {
+            self.drained.notify_waiters();
+        }
+    }
+
+    /// Refuses a stream open (RST Refused, retry-safe) without unbounded
+    /// queueing: `try_send` on the bounded data queue, and if the writer is
+    /// wedged (queue full) close the connection rather than let a peer that
+    /// floods opens past the ceiling accumulate resets on the control queue.
+    fn refuse_open(&self, id: u32) {
+        if self
+            .write
+            .data_tx
+            .try_send(WriteHandle::reset_op(id, RstCode::Refused))
+            .is_err()
+        {
+            self.io.close(CloseReason::Local);
         }
     }
 }
@@ -542,11 +559,11 @@ async fn run_conn<S>(
     cfg: Config,
     service: S,
     state: Arc<ServeState>,
+    info: ShmscConnectInfo,
 ) where
     S: ServeService,
 {
     let seg = Arc::new(seg);
-    let info = peer_info(&sock);
     let io = ConnIo::new(sock);
     let l = seg.layout;
     // Server produces into s2c, consumes from c2s.
@@ -577,6 +594,7 @@ async fn run_conn<S>(
         write: write.clone(),
         streams: std::sync::Mutex::new(HashMap::new()),
         last_accepted: AtomicU32::new(0),
+        last_seen: AtomicU32::new(0),
         draining: AtomicBool::new(false),
         goaway_sent: AtomicBool::new(false),
         active: AtomicUsize::new(0),
@@ -674,34 +692,28 @@ where
                     "client-initiated stream id {id} must be odd"
                 )));
             }
-            if id <= conn.last_accepted.load(Ordering::Acquire) {
+            // Monotonic id check against the highest OBSERVED id, then retire
+            // this id immediately — accepted or refused — so a refused stream's
+            // id can never be reused or undercut after capacity frees up.
+            if id <= conn.last_seen.load(Ordering::Acquire) {
                 return Err(ProtocolError(format!("stream id {id} not increasing")));
             }
+            conn.last_seen.store(id, Ordering::Release);
             if conn.draining.load(Ordering::Acquire) {
                 // Refused before any processing: safe for the client to retry
                 // on a new connection.
-                conn.write.send_ctrl(WriteOp::Frame {
-                    typ: FrameType::RstStream,
-                    flags: 0,
-                    stream_id: id,
-                    payload: frame::encode_rst(RstCode::Refused),
-                });
+                conn.refuse_open(id);
                 return Ok(());
             }
             // Enforce the operator's concurrent-stream ceiling BEFORE allocating
             // any per-stream state or spawning a handler, so a client cannot
-            // exhaust memory past a configured bound. RST(Refused) is retry-safe.
-            // `active` is incremented only by this single-threaded demux and
-            // decremented by handler completion, so the load is an accurate gate.
+            // exhaust memory past a configured bound. `active` is incremented
+            // only by this single-threaded demux and decremented by handler
+            // completion, so the load is an accurate gate.
             if let Some(max) = conn.max_streams
                 && conn.active.load(Ordering::Acquire) >= max as usize
             {
-                conn.write.send_ctrl(WriteOp::Frame {
-                    typ: FrameType::RstStream,
-                    flags: 0,
-                    stream_id: id,
-                    payload: frame::encode_rst(RstCode::Refused),
-                });
+                conn.refuse_open(id);
                 return Ok(());
             }
             let block = frame::decode_header_block(frame.payload)?;
@@ -797,10 +809,7 @@ where
                 if let Some(task) = &e.task {
                     task.abort();
                 }
-                let left = conn.active.fetch_sub(1, Ordering::AcqRel) - 1;
-                if left == 0 {
-                    conn.drained.notify_waiters();
-                }
+                conn.on_stream_removed();
             }
             Ok(())
         }
@@ -821,24 +830,7 @@ where
             // opening streams).
             Ok(())
         }
-        FrameType::Ping => {
-            frame.validate_ping()?;
-            if frame.flags & FLAG_ACK == 0 {
-                // Fail the connection on a PING flood (peer keeps sending while
-                // refusing to drain our outbound ring) instead of pinning an
-                // unbounded queue of acks.
-                if !conn.io.queue_ping_ack() {
-                    return Err(ProtocolError("peer flooded unacknowledged PINGs".into()));
-                }
-                conn.write.send_ctrl(WriteOp::Frame {
-                    typ: FrameType::Ping,
-                    flags: FLAG_ACK,
-                    stream_id: 0,
-                    payload: frame.payload,
-                });
-            }
-            Ok(())
-        }
+        FrameType::Ping => super::conn::handle_ping(&conn.io, &conn.write, frame),
     }
 }
 

@@ -24,7 +24,7 @@ use super::conn::{
     BodyEvent, CloseReason, Config, ConnIo, RecvCredit, SendWindow, ShmBody, SpinBudget,
     WriteHandle, WriteOp, client_handshake, read_frame, writer_loop,
 };
-use super::frame::{self, FLAG_ACK, Frame, FrameType, ProtocolError, RstCode};
+use super::frame::{self, Frame, FrameType, ProtocolError, RstCode};
 use super::ring::{Consumer, Producer};
 
 /// Highest usable stream id; beyond it the connection must be replaced.
@@ -110,6 +110,32 @@ impl ClientConn {
     fn status_for_close(reason: &CloseReason) -> Status {
         Status::unavailable(format!("shmsc connection lost: {reason}"))
     }
+
+    /// Cancels a stream from a post-header context (response body drop, request
+    /// error): remove it — aborting the pump — and RST(Cancel) on the control
+    /// queue, where HEADERS is already on the wire so ordering is moot.
+    fn reset_stream(&self, id: u32) {
+        self.remove_entry(id);
+        self.write.send_reset(id, RstCode::Cancel);
+    }
+
+    /// Cancels a *pre-header* stream: remove it, then RST(Cancel) must follow
+    /// HEADERS on the ordered data queue (a control-queue RST could overtake a
+    /// still-queued HEADERS and orphan the server handler). `try_send` keeps it
+    /// bounded and synchronous — no spawned task pinning the connection; if the
+    /// queue is full the writer is wedged, so close the connection and let the
+    /// server observe EOF rather than accumulate resets.
+    fn reset_stream_ordered(&self, id: u32) {
+        self.remove_entry(id);
+        if self
+            .write
+            .data_tx
+            .try_send(WriteHandle::reset_op(id, RstCode::Cancel))
+            .is_err()
+        {
+            self.io.close(CloseReason::Local);
+        }
+    }
 }
 
 impl Drop for ClientConn {
@@ -140,41 +166,8 @@ impl PendingStreamGuard {
 
 impl Drop for PendingStreamGuard {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let conn = self.conn.clone();
-        let id = self.id;
-        // Drop cannot await, and the RST must follow HEADERS on the *ordered*
-        // data queue: a control-queue RST could overtake a still-queued HEADERS
-        // and reach the server first, which would then open and orphan the
-        // handler. So run the ordered cleanup on a detached task; fall back to
-        // the priority queue only if there is no runtime to spawn on.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    conn.remove_entry(id);
-                    let _ = conn
-                        .write
-                        .data_tx
-                        .send(WriteOp::Frame {
-                            typ: FrameType::RstStream,
-                            flags: 0,
-                            stream_id: id,
-                            payload: frame::encode_rst(RstCode::Cancel),
-                        })
-                        .await;
-                });
-            }
-            Err(_) => {
-                conn.remove_entry(id);
-                conn.write.send_ctrl(WriteOp::Frame {
-                    typ: FrameType::RstStream,
-                    flags: 0,
-                    stream_id: id,
-                    payload: frame::encode_rst(RstCode::Cancel),
-                });
-            }
+        if self.armed {
+            self.conn.reset_stream_ordered(self.id);
         }
     }
 }
@@ -427,24 +420,7 @@ fn handle_frame(conn: &Arc<ClientConn>, frame: Frame) -> Result<(), ProtocolErro
             }
             Ok(())
         }
-        FrameType::Ping => {
-            frame.validate_ping()?;
-            if frame.flags & FLAG_ACK == 0 {
-                // Fail the connection on a PING flood (peer keeps sending while
-                // refusing to drain our outbound ring) instead of pinning an
-                // unbounded queue of acks.
-                if !conn.io.queue_ping_ack() {
-                    return Err(ProtocolError("peer flooded unacknowledged PINGs".into()));
-                }
-                conn.write.send_ctrl(WriteOp::Frame {
-                    typ: FrameType::Ping,
-                    flags: FLAG_ACK,
-                    stream_id: 0,
-                    payload: frame.payload,
-                });
-            }
-            Ok(())
-        }
+        FrameType::Ping => super::conn::handle_ping(&conn.io, &conn.write, frame),
     }
 }
 
@@ -604,15 +580,7 @@ async fn call_inner(
         Body::new(ShmBody::new(
             body_rx,
             credit,
-            Box::new(move || {
-                rst_conn.remove_entry(id);
-                rst_conn.write.send_ctrl(WriteOp::Frame {
-                    typ: FrameType::RstStream,
-                    flags: 0,
-                    stream_id: id,
-                    payload: frame::encode_rst(RstCode::Cancel),
-                });
-            }),
+            Box::new(move || rst_conn.reset_stream(id)),
         ))
     };
     let mut resp = Response::new(body);
@@ -660,13 +628,7 @@ async fn pump_request_body(conn: Arc<ClientConn>, id: u32, body: Body, window: A
                 // The request stream failed locally: reset so the server
                 // stops waiting, and surface nothing further.
                 let _ = status;
-                conn.remove_entry(id);
-                conn.write.send_ctrl(WriteOp::Frame {
-                    typ: FrameType::RstStream,
-                    flags: 0,
-                    stream_id: id,
-                    payload: frame::encode_rst(RstCode::Cancel),
-                });
+                conn.reset_stream(id);
                 return;
             }
             None => {

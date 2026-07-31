@@ -38,7 +38,10 @@ use tokio::io::Interest;
 use tokio::sync::{Notify, mpsc, watch};
 
 use super::conduit::{self, Conduit};
-use super::frame::{FLAG_ACK, FRAME_HDR_SIZE, Frame, FrameType, encode_frame_header};
+use super::frame::{
+    FLAG_ACK, FRAME_HDR_SIZE, Frame, FrameType, ProtocolError, RstCode, encode_frame_header,
+    encode_rst,
+};
 use super::ring::{Consumer, Producer};
 use super::seg::{Layout, MAX_RING_CAP, MIN_RING_CAP, Segment};
 
@@ -362,14 +365,10 @@ impl ConnIo {
     }
 
     /// Releases a queued PING-ack slot once the writer has emitted the ack.
+    /// Only ever decrements slots reserved by `queue_ping_ack`, so it cannot
+    /// underflow.
     pub(crate) fn ping_ack_sent(&self) {
-        // Only decrements slots reserved by `queue_ping_ack`, so it never
-        // underflows; saturate anyway for safety.
-        let _ = self
-            .pending_ping_acks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(1))
-            });
+        self.pending_ping_acks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn is_graceful(&self) -> bool {
@@ -717,6 +716,48 @@ impl WriteHandle {
     pub(crate) fn send_ctrl(&self, op: WriteOp) {
         let _ = self.ctrl_tx.send(op);
     }
+
+    /// Builds an RST_STREAM op for `stream_id` — the single place the frame is
+    /// constructed, so the reset sites across client and server cannot drift.
+    pub(crate) fn reset_op(stream_id: u32, code: RstCode) -> WriteOp {
+        WriteOp::Frame {
+            typ: FrameType::RstStream,
+            flags: 0,
+            stream_id,
+            payload: encode_rst(code),
+        }
+    }
+
+    /// Sends RST_STREAM on the control (priority) queue — for a reset whose
+    /// stream already has HEADERS on the wire, where ordering is moot.
+    pub(crate) fn send_reset(&self, stream_id: u32, code: RstCode) {
+        self.send_ctrl(Self::reset_op(stream_id, code));
+    }
+}
+
+/// Handles an inbound PING for either demux loop: validate it, bound the ack
+/// flood, and echo the ACK. Centralized so client and server enforce identical
+/// flood policy — a security invariant that must not drift between the peers.
+pub(crate) fn handle_ping(
+    io: &ConnIo,
+    write: &WriteHandle,
+    frame: Frame,
+) -> Result<(), ProtocolError> {
+    frame.validate_ping()?;
+    if frame.flags & FLAG_ACK == 0 {
+        // A peer flooding PINGs while refusing to drain our outbound ring would
+        // otherwise pin an unbounded queue of acks; fail the connection.
+        if !io.queue_ping_ack() {
+            return Err(ProtocolError("peer flooded unacknowledged PINGs".into()));
+        }
+        write.send_ctrl(WriteOp::Frame {
+            typ: FrameType::Ping,
+            flags: FLAG_ACK,
+            stream_id: 0,
+            payload: frame.payload,
+        });
+    }
+    Ok(())
 }
 
 /// Runs the writer task: drains the control queue first, then the data queue,
