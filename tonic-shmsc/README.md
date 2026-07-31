@@ -101,16 +101,45 @@ Windows CI. See [DESIGN.md](DESIGN.md) for the full delta list.
 
 ## Benchmarks
 
-`cargo run -p tonic-shmsc --example bench --release` compares the same echo
-service over shmsc and over tonic's stock hyper/h2 transport (the port of
-the Go PR's `benchmark/shmsccmp` harness). Baseline on an Apple Silicon
-laptop (macOS, one process pair, release build):
+Two regimes matter for a shared-memory transport, and they answer different
+questions.
 
-| transport | unary 1 KiB p50 | p99 | 16 MiB echo |
+**Round-trip latency** (unary + small messages) — the in-crate harness, a
+port of the Go PR's `benchmark/shmsccmp`, reports unary p50/p99 and echo
+throughput for shmsc vs tonic's stock hyper/h2 transport over a Unix socket
+and TCP loopback, on your own machine:
+
+```
+cargo run -p tonic-shmsc --example bench --release
+```
+
+**Sustained throughput** (the wire as the bottleneck) — measured with an
+external multi-transport harness that pushes fully-pipelined bulk streams
+through a drain-only RPC, so the number reflects the transport rather than
+per-message hashing or round-trip stalls. Sustained bulk throughput for this
+crate, trimmed mean of 10 runs, one concurrent stream → eight. **Illustrative
+and machine-specific** — shared memory scales with core count and memory
+bandwidth, so treat these as shape, not spec:
+
+| machine (all ARM64) | shmsc GiB/s (1→8 streams) | vs gRPC/TCP | vs gRPC/UDS |
 |---|---|---|---|
-| shmsc (shared memory) | 23.8 µs | 37.3 µs | 5.73 GiB/s |
-| hyper/h2 over unix socket | 35.2 µs | 51.0 µs | 1.60 GiB/s |
-| hyper/h2 over tcp loopback | 61.4 µs | 141.0 µs | 3.16 GiB/s |
+| Apple Silicon laptop, macOS native | 10–16 | 2.7–6.4× | 14–22×* |
+| Apple Silicon, Linux container | 6.5–11 | 2.0–3.9× | 2.7–6.2× |
+| NVIDIA Grace GB10, Linux bare metal | 3.0–6.4 | 1.7–3.0× | 1.9–3.6× |
+
+Two takeaways hold on every machine: shmsc's advantage over standard gRPC
+**grows with stream concurrency** — its per-stream ring copies parallelize
+across cores while a shared kernel socket serializes — and correctness is
+**byte-identical** across all three transports on every run. The absolute
+ceiling here is conservative: the proto payload is `Vec<u8>`, so each send
+costs one clone paid equally by every transport, and even shmsc's 10–20 GiB/s
+sits below the raw ring's bandwidth — i.e. the gRPC codec/framing stack, not
+the wire, is now the limit.
+
+<sub>*macOS UDS is anomalously slow (a tonic/grpc Unix-socket path cost on
+Darwin, ~0.7–1.1 GiB/s, slower even than its own TCP loopback), which
+inflates the UDS multiplier there; treat the TCP column as the trustworthy
+standard-gRPC baseline.</sub>
 
 ## Status
 

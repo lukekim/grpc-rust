@@ -263,3 +263,11 @@ Mirroring the Go DESIGN's list where it still applies:
   first draft of that list.)
 - Whether `Channel`'s balance path should expose per-endpoint transport
   health beyond `poll_ready` errors.
+- Sustained-throughput measurement (an external harness: drain-only bulk
+  streaming, trimmed mean of 10 across three ARM64 machines) puts shmsc at
+  1.7–6.4x standard gRPC over TCP loopback and, unlike the kernel-socket
+  transports, *scaling with stream concurrency* rather than flattening. It
+  also shows shmsc topping out below raw ring bandwidth — the gRPC
+  codec/framing stack, not the wire, is the remaining ceiling — which bounds
+  how much the full read-side zero-copy (§7) can buy above the seam, and is
+  the throughput-side counterpart to the Grace large-message anomaly (§8).
