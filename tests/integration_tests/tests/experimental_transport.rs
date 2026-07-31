@@ -16,7 +16,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use integration_tests::pb::{Input1, Output1, test1_client::Test1Client, test1_server};
+use integration_tests::pb::{test1_client::Test1Client, test1_server, Input1, Output1};
+use tokio_stream::StreamExt;
 use tonic::transport::experimental::client::{
     ClientBuildOptions, ClientTransport, ClientTransportBuilder,
 };
@@ -25,7 +26,6 @@ use tonic::transport::experimental::server::{
 };
 use tonic::transport::{Endpoint, Server};
 use tonic::{Request, Response, Status};
-use tokio_stream::StreamExt;
 
 // ---- the fake transport ------------------------------------------------
 
@@ -44,8 +44,12 @@ impl ClientTransportBuilder for FakeClientBuilder {
         &self,
         target: http::Uri,
         _opts: ClientBuildOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<ClientTransport, tonic::transport::experimental::BoxError>> + Send>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ClientTransport, tonic::transport::experimental::BoxError>>
+                + Send,
+        >,
+    > {
         Box::pin(async move {
             let key = target.path().to_owned();
             let svc = FAKE_WIRE
@@ -84,7 +88,9 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for FakeClient {
         let mut svc = self.svc.clone();
         Box::pin(async move {
             // Infallible: the response is always Ok, so surface it directly.
-            let resp = tower_service::Service::call(&mut svc, req).await.unwrap_or_else(|e| match e {});
+            let resp = tower_service::Service::call(&mut svc, req)
+                .await
+                .unwrap_or_else(|e| match e {});
             Ok(resp)
         })
     }
@@ -97,8 +103,16 @@ impl ServerTransportBuilder for FakeServerBuilder {
         &self,
         target: &str,
         _opts: ServerBuildOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn ServerTransport>, tonic::transport::experimental::BoxError>> + Send>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Box<dyn ServerTransport>,
+                        tonic::transport::experimental::BoxError,
+                    >,
+                > + Send,
+        >,
+    > {
         let target = target.to_owned();
         Box::pin(async move { Ok(Box::new(FakeServer { target }) as Box<dyn ServerTransport>) })
     }
@@ -116,7 +130,10 @@ impl ServerTransport for FakeServer {
     ) -> Pin<Box<dyn Future<Output = Result<(), tonic::transport::experimental::BoxError>> + Send>>
     {
         Box::pin(async move {
-            FAKE_WIRE.lock().unwrap().insert(self.target.clone(), service);
+            FAKE_WIRE
+                .lock()
+                .unwrap()
+                .insert(self.target.clone(), service);
             shutdown.await;
             FAKE_WIRE.lock().unwrap().remove(&self.target);
             Ok(())
@@ -198,7 +215,9 @@ async fn unary_over_fake_transport() {
 
     let mut client = Test1Client::new(fake_channel(target).await);
     let resp = client
-        .unary_call(Request::new(Input1 { buf: b"hello-fake".to_vec() }))
+        .unary_call(Request::new(Input1 {
+            buf: b"hello-fake".to_vec(),
+        }))
         .await
         .expect("unary");
     assert_eq!(resp.into_inner().buf, b"hello-fake");
@@ -234,7 +253,9 @@ async fn error_status_propagates_over_fake_transport() {
 
     let mut client = Test1Client::new(fake_channel(target).await);
     let err = client
-        .unary_call(Request::new(Input1 { buf: b"fail".to_vec() }))
+        .unary_call(Request::new(Input1 {
+            buf: b"fail".to_vec(),
+        }))
         .await
         .expect_err("must fail");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
@@ -268,8 +289,13 @@ async fn connect_timeout_is_honored() {
             &self,
             _t: http::Uri,
             _o: ClientBuildOptions,
-        ) -> Pin<Box<dyn Future<Output = Result<ClientTransport, tonic::transport::experimental::BoxError>> + Send>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<ClientTransport, tonic::transport::experimental::BoxError>,
+                    > + Send,
+            >,
+        > {
             Box::pin(std::future::pending())
         }
     }
