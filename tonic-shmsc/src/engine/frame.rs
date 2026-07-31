@@ -79,6 +79,13 @@ pub(crate) const FLAG_END_STREAM: u8 = 0x1;
 /// Flag bit (PING only): this is an acknowledgement.
 pub(crate) const FLAG_ACK: u8 = 0x2;
 
+/// Maximum PING payload (opaque data), matching HTTP/2's fixed 8-byte ping.
+/// A PING — or the ACK that echoes it — larger than this, or carried on a
+/// non-zero stream, is a protocol violation. Bounding it stops a hostile peer
+/// from amplifying a flood of unacked PINGs into unbounded queued payload
+/// allocations.
+pub(crate) const PING_MAX_PAYLOAD: usize = 8;
+
 /// Stream error codes carried by RST_STREAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -113,6 +120,26 @@ pub(crate) struct Frame {
 impl Frame {
     pub(crate) fn end_stream(&self) -> bool {
         self.flags & FLAG_END_STREAM != 0
+    }
+
+    /// Validates an inbound PING: it must be connection-level (`stream_id 0`)
+    /// with an opaque payload no larger than [`PING_MAX_PAYLOAD`]. A peer that
+    /// sends an oversized or misdirected PING is failed, which (together with
+    /// the bounded ack queue) caps the memory a flood of PINGs can pin.
+    pub(crate) fn validate_ping(&self) -> Result<(), ProtocolError> {
+        if self.stream_id != 0 {
+            return Err(ProtocolError(format!(
+                "PING must be connection-level (stream_id 0), got {}",
+                self.stream_id
+            )));
+        }
+        if self.payload.len() > PING_MAX_PAYLOAD {
+            return Err(ProtocolError(format!(
+                "PING payload {} exceeds {PING_MAX_PAYLOAD} bytes",
+                self.payload.len()
+            )));
+        }
+        Ok(())
     }
 }
 

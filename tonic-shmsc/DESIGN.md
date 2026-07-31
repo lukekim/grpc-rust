@@ -190,7 +190,7 @@ Deliberate scope differences, not oversights:
 | INLINE_TX (`ProtoWriteStream`) marshal-into-ring | Not ported; tonic's codec owns marshalling above the seam. The Go API itself makes this optional — a transport MAY implement it — so its absence does not change the contract |
 | BDP estimation, adaptive spin, keepalive pings | Static windows; liveness via socket EOF; PING frames reserved |
 | `resolver.Address.TransportType` participates in `AddressMap` identity | tonic has no address map; `transport_type` lives on `Endpoint`, and `balance_list` keys endpoints explicitly |
-| grpc-go server honors max-streams from the segment header | `max_concurrent_streams` is passed as a build option hint (not yet enforced) |
+| grpc-go server honors max-streams from the segment header | `Server::max_concurrent_streams` is enforced per connection: opens past the ceiling are refused with RST(Refused) before any per-stream allocation |
 | Optional symmetric nonce handshake | Not ported (it is advisory-only in Go: the nonce is not challenge-bound) |
 
 ## 8. Known limitations
@@ -198,7 +198,12 @@ Deliberate scope differences, not oversights:
 - Insecure-only (see §6).
 - `ClientBuildOptions` window hints are not honored on the dialing side —
   the server assigns both directions' windows in the hello.
-- `ServerBuildOptions::max_concurrent_streams` is not yet enforced.
+- On non-Linux Unix (macOS), the shared segment cannot be size-sealed (there
+  is no `memfd`-seal equivalent), so the Linux guard against a hostile peer
+  `ftruncate`-ing the passed fd — which would SIGBUS the other side on its next
+  ring access — does not apply there. On Linux the segment is sealed
+  (`F_SEAL_SHRINK`/`GROW`/`SEAL`) at creation; on macOS the same-uid accept
+  check and the trusted-peer model are the boundary.
 - Malformed frames fail the connection (the Go engine fails the stream);
   with a trusted same-host peer either is defensible, and failing the
   connection is the safer default for a byte stream that cannot resync.
@@ -225,21 +230,34 @@ Beyond the selection-path e2e (`tests/e2e.rs`) and fail-closed dispatch
   "process death reclaims everything" — a claim no in-process test can make.
 - **`tests/hostile.rs`** (feature `_test-support`) — the trust boundary. A
   raw peer completes the handshake then writes every flavor of garbage
-  (unknown frame types, oversized lengths, even/backwards stream ids, pure
-  random bytes); the server must fail *that connection* cleanly and keep
-  serving others. Found and fixed a real bug: a frame-header protocol error
-  left the connection half-open instead of closing it (§ demux teardown).
+  (unknown frame types, oversized lengths, even/backwards stream ids,
+  oversized or misdirected PINGs, pure random bytes); the server must fail
+  *that connection* cleanly and keep serving others. Found and fixed a real
+  bug: a frame-header protocol error left the connection half-open instead of
+  closing it (§ demux teardown).
 - **`tests/robustness.rs`** — the tiny-window/tiny-ring large-message
   deadlock regression (the Go engine's documented WINDOW_UPDATE hazard, our
   `wu_threshold` floor's test), the concurrent-stream-open race the
   comparison harness first exposed, reconnect-through-registry, and
   graceful-drain-completes-inflight (which found and fixed the graceful
   flush gap in § lifecycle).
+- **`tests/limits.rs`** — resource-limit and cancellation regressions from the
+  adversarial review: `Server::max_concurrent_streams` is actually enforced (a
+  third concurrent open is refused once the ceiling is reached), and cancelling
+  a call before its response head aborts the server handler (the client's
+  pending-stream guard sends an ordered RST the server acts on).
+- **`tests/lifetime.rs`** — dropping the last client channel must close the
+  connection: churning connect → RPC → drop cycles must not grow the process's
+  open-fd count (the demux no longer pins the connection after the handle is
+  gone).
 - **codec + ring fuzz/adversarial unit tests** — random and adversarial
   bytes through the frame and header-block decoders never panic or allocate
   unboundedly; a peer scribbling corrupt ring indices is always clamped,
   never OOB. These test the "hostile peer can corrupt data, never cause UB"
-  property directly (and would light up under Miri/ASan).
+  property directly (and would light up under Miri/ASan). Alongside them:
+  the Linux segment fd is size-sealed against `ftruncate` (seg.rs), and
+  shutdown cleanup removes a socket only when its device+inode still match the
+  one bound (server.rs), so a rolling restart's replacement is never deleted.
 - **micro-benches** (`bench_ring_throughput`, `bench_frame_codec`, run with
   `--ignored --nocapture`) — component-level regression guards for the
   single-copy ring path and the codec, which the end-to-end harness cannot

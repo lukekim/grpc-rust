@@ -38,9 +38,15 @@ use tokio::io::Interest;
 use tokio::sync::{Notify, mpsc, watch};
 
 use super::conduit::{self, Conduit};
-use super::frame::{FRAME_HDR_SIZE, Frame, FrameType, encode_frame_header};
+use super::frame::{FLAG_ACK, FRAME_HDR_SIZE, Frame, FrameType, encode_frame_header};
 use super::ring::{Consumer, Producer};
 use super::seg::{Layout, MAX_RING_CAP, MIN_RING_CAP, Segment};
+
+/// Cap on PING acknowledgements queued but not yet written. A peer that floods
+/// PINGs while refusing to drain the outbound ring (so the writer parks) would
+/// otherwise pin one queued allocation per PING without bound; past this cap
+/// the demux fails the connection. See `ConnIo::queue_ping_ack`.
+const MAX_PENDING_PING_ACKS: u32 = 64;
 
 /// Tuning knobs for one connection / listener.
 #[derive(Debug, Clone)]
@@ -51,6 +57,10 @@ pub(crate) struct Config {
     pub(crate) stream_window: u32,
     /// Largest DATA payload emitted in one frame; larger messages are chunked.
     pub(crate) max_frame: usize,
+    /// Server-side ceiling on concurrent streams per connection (the engine
+    /// side of `Server::max_concurrent_streams`); `None` is unlimited. Ignored
+    /// by the client (the server enforces it).
+    pub(crate) max_streams: Option<u32>,
     /// Microseconds to busy-spin re-checking the ring before parking on the
     /// doorbell. Under back-to-back traffic the peer's next action usually
     /// lands within this budget, eliding the parked flag, the doorbell
@@ -69,6 +79,7 @@ impl Default for Config {
             ring_size: 16 * 1024 * 1024,
             stream_window: 8 * 1024 * 1024,
             max_frame: 1024 * 1024,
+            max_streams: None,
             spin_us: 0,
         }
     }
@@ -308,6 +319,9 @@ pub(crate) struct ConnIo {
     /// Notified once the writer has flushed everything and the outbound ring
     /// is empty.
     flushed: Notify,
+    /// PING acknowledgements queued but not yet written by the writer. Bounds
+    /// the memory a PING flood can pin (see `MAX_PENDING_PING_ACKS`).
+    pending_ping_acks: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for ConnIo {
@@ -331,11 +345,31 @@ impl ConnIo {
             graceful: AtomicBool::new(false),
             graceful_wake: Notify::new(),
             flushed: Notify::new(),
+            pending_ping_acks: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Reserves a slot for one queued PING acknowledgement. Returns `false`
+    /// when too many acks are already queued unsent, signalling the caller to
+    /// fail the connection (a PING flood). Paired with `ping_ack_sent`, which
+    /// the writer calls after emitting an ack.
+    pub(crate) fn queue_ping_ack(&self) -> bool {
+        self.pending_ping_acks.fetch_add(1, Ordering::AcqRel) < MAX_PENDING_PING_ACKS
+    }
+
+    /// Releases a queued PING-ack slot once the writer has emitted the ack.
+    pub(crate) fn ping_ack_sent(&self) {
+        // Only decrements slots reserved by `queue_ping_ack`, so it never
+        // underflows; saturate anyway for safety.
+        let _ = self
+            .pending_ping_acks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     fn is_graceful(&self) -> bool {
@@ -756,6 +790,11 @@ pub(crate) async fn writer_loop(
                 (FrameType::Data, flags, stream_id, payload)
             }
         };
+        // Release the PING-ack slot as the ack leaves the queue, so the flood
+        // bound (`MAX_PENDING_PING_ACKS`) measures only unsent acks.
+        if typ == FrameType::Ping && flags & FLAG_ACK != 0 {
+            io.ping_ack_sent();
+        }
         let mut hdr = [0u8; FRAME_HDR_SIZE];
         encode_frame_header(&mut hdr, typ, flags, stream_id, payload.len());
         // Header then payload, each pushed fully before the next op; the

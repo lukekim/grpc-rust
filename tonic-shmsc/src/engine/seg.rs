@@ -235,12 +235,15 @@ impl Segment {
 fn create_anon_fd(len: usize) -> io::Result<OwnedFd> {
     #[cfg(target_os = "linux")]
     let fd = {
+        // MFD_ALLOW_SEALING so the size can be frozen after ftruncate (below):
+        // once shared with the peer, a hostile dialer must not be able to
+        // shrink the segment and SIGBUS us on the next ring access.
         // SAFETY: plain syscall; the name is a debugging label only.
         let raw = unsafe {
             libc::syscall(
                 libc::SYS_memfd_create,
                 c"shmsc-segment".as_ptr(),
-                libc::MFD_CLOEXEC as libc::c_uint,
+                (libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) as libc::c_uint,
             )
         };
         if raw < 0 {
@@ -295,6 +298,30 @@ fn create_anon_fd(len: usize) -> io::Result<OwnedFd> {
     let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
+    }
+    // Linux: freeze the size before the fd is mapped or passed to the peer.
+    // F_SEAL_SHRINK | F_SEAL_GROW make the segment un-resizable by anyone
+    // holding the fd (including the peer we hand it to over SCM_RIGHTS), so a
+    // hostile peer cannot `ftruncate` it out from under our mapping and
+    // SIGBUS this process on the next access past the new EOF; F_SEAL_SEAL
+    // prevents the seals from being lifted. Writes are unaffected (no
+    // F_SEAL_WRITE), so both rings still work. macOS/other Unix have no
+    // memfd-style seal — see DESIGN.md §8; the anti-SIGBUS guarantee is
+    // Linux-only there.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: F_ADD_SEALS on our own freshly created memfd, before it is
+        // mapped or shared.
+        let rc = unsafe {
+            libc::fcntl(
+                fd.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(fd)
 }
@@ -588,5 +615,31 @@ mod tests {
             seg.base().add(layout.c2s_data).write(0xEE);
             assert_eq!(seg2.base().add(layout.c2s_data).read(), 0xEE);
         }
+    }
+
+    /// The created segment fd must be size-sealed so a peer holding it (passed
+    /// over SCM_RIGHTS) cannot `ftruncate` it and SIGBUS the other side on the
+    /// next ring access — the truncation attack from the adversarial review.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_segment_size_is_sealed() {
+        let layout = Layout::new(4096, 4096).unwrap();
+        let seg = Segment::create(layout).unwrap();
+        let fd = seg.fd().as_raw_fd();
+        // Shrink and grow must both be refused (EPERM) by the size seals.
+        // SAFETY: ftruncate on a valid owned fd; we assert it is refused.
+        let shrink = unsafe { libc::ftruncate(fd, 0) };
+        assert_ne!(shrink, 0, "shrink must be refused by F_SEAL_SHRINK");
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        // SAFETY: as above.
+        let grow = unsafe { libc::ftruncate(fd, (layout.total + 4096) as libc::off_t) };
+        assert_ne!(grow, 0, "grow must be refused by F_SEAL_GROW");
+        // And the seal set itself is locked (F_SEAL_SEAL), so it cannot be lifted.
+        // SAFETY: F_GET_SEALS on a valid fd.
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        assert!(
+            seals >= 0 && seals & libc::F_SEAL_SEAL != 0,
+            "seals must be locked"
+        );
     }
 }

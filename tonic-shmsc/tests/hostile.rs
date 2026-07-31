@@ -154,6 +154,23 @@ async fn garbage_frames_fail_connection_not_process() {
                 p.send_raw(&junk);
             }),
         ),
+        (
+            "oversized-ping",
+            Box::new(|p: &mut RawPeer| {
+                // A PING carrying more than 8 opaque bytes is the amplification
+                // a flood would exploit (each ack echoes the payload). It must
+                // be rejected, capping the per-PING allocation.
+                p.send_frame(7 /* Ping */, 0, 0, &[0u8; 4096]);
+            }),
+        ),
+        (
+            "ping-on-nonzero-stream",
+            Box::new(|p: &mut RawPeer| {
+                // PING is connection-level; a non-zero stream id is a protocol
+                // violation.
+                p.send_frame(7 /* Ping */, 0, 9, b"12345678");
+            }),
+        ),
     ];
 
     for (name, hostile) in scenarios {

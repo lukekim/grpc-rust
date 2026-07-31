@@ -150,6 +150,19 @@ fn peer_info(sock: &Conduit) -> ShmscConnectInfo {
     info
 }
 
+/// Only a peer with the same effective uid as the server process may connect.
+/// Enforced at accept — before any segment is created or handed out — so the
+/// unavoidable window between binding the rendezvous socket and tightening it
+/// to mode 0600 cannot be used by another local user to obtain a segment or
+/// invoke RPCs. This is the authoritative owner-only boundary; the socket mode
+/// is defense-in-depth. Fails closed if the peer uid cannot be determined.
+#[cfg(unix)]
+fn peer_authorized(sock: &Conduit) -> bool {
+    // SAFETY: geteuid is always safe and never fails.
+    let me = unsafe { libc::geteuid() };
+    matches!(peer_info(sock).peer_uid, Some(uid) if uid == me)
+}
+
 /// The platform accept source: a bound Unix listener, or the named-pipe
 /// instance chain on Windows (one pending instance is always kept so a
 /// connecting client never races an instance-less name).
@@ -192,6 +205,14 @@ pub(crate) struct ShmscListener {
     acceptor: Option<Acceptor>,
     path: PathBuf,
     cfg: Config,
+    /// (dev, ino) of the socket we bound, so cleanup only ever removes *our*
+    /// socket — never a replacement listener's that rebound the same path.
+    #[cfg(unix)]
+    sock_id: Option<(u64, u64)>,
+    /// Cleared once `serve` has done its explicit unlink, so `Drop` does not
+    /// unlink a second time and delete a replacement bound during our drain.
+    #[cfg(unix)]
+    cleanup: bool,
 }
 
 impl std::fmt::Debug for ShmscListener {
@@ -244,10 +265,13 @@ impl ShmscListener {
         // The socket is the security boundary (as the segment file is in the
         // Go engine): only the owner may connect.
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        let sock_id = sock_ident(path);
         Ok(ShmscListener {
             acceptor: Some(Acceptor { listener }),
             path: path.to_owned(),
             cfg,
+            sock_id,
+            cleanup: true,
         })
     }
 
@@ -302,6 +326,14 @@ impl ShmscListener {
             tokio::select! {
                 accepted = acceptor.accept() => {
                     let sock = accepted?;
+                    // Authorize the peer (same uid) before creating or passing a
+                    // segment — this closes the bind→chmod authorization race,
+                    // regardless of the socket's transient permissions.
+                    #[cfg(unix)]
+                    if !peer_authorized(&sock) {
+                        tracing::debug!("shmsc: refused connection from a different uid");
+                        continue;
+                    }
                     let cfg = self.cfg.clone();
                     let svc = service.clone();
                     let state = state.clone();
@@ -327,9 +359,13 @@ impl ShmscListener {
         // tasks.
         state.begin_drain();
         drop(acceptor);
+        // Unlink our socket (only if the path still resolves to it) and disarm
+        // the Drop cleanup, so a replacement listener that rebinds the path
+        // while we drain is never deleted by this listener's teardown.
         #[cfg(unix)]
         {
-            let _ = std::fs::remove_file(&self.path);
+            unlink_if_ours(&self.path, self.sock_id);
+            self.cleanup = false;
         }
         while conn_tasks.join_next().await.is_some() {}
         Ok(())
@@ -339,22 +375,65 @@ impl ShmscListener {
 #[cfg(unix)]
 impl Drop for ShmscListener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only if `serve` did not already unlink, and only if the path still
+        // resolves to *our* socket (never a replacement's).
+        if self.cleanup {
+            unlink_if_ours(&self.path, self.sock_id);
+        }
+    }
+}
+
+/// (dev, ino) identifying the socket file just bound, for later
+/// match-guarded cleanup.
+#[cfg(unix)]
+fn sock_ident(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// Removes `path` only if it still names the exact socket identified by `id`
+/// (same device + inode), so a rolling restart's replacement listener — which
+/// may have rebound the same path — is never deleted by this listener's
+/// teardown.
+#[cfg(unix)]
+fn unlink_if_ours(path: &Path, id: Option<(u64, u64)>) {
+    use std::os::unix::fs::MetadataExt;
+    if let Some((dev, ino)) = id
+        && let Ok(m) = std::fs::symlink_metadata(path)
+        && m.dev() == dev
+        && m.ino() == ino
+    {
+        let _ = std::fs::remove_file(path);
     }
 }
 
 /// Serve-wide state: live connections for GOAWAY fan-out on drain.
 #[derive(Default)]
 struct ServeState {
-    conns: std::sync::Mutex<Vec<std::sync::Weak<ServerConn>>>,
-    draining: AtomicBool,
+    inner: std::sync::Mutex<ServeInner>,
+}
+
+#[derive(Default)]
+struct ServeInner {
+    conns: Vec<std::sync::Weak<ServerConn>>,
+    draining: bool,
 }
 
 impl ServeState {
-    fn register(&self, conn: &Arc<ServerConn>) {
-        let mut conns = self.conns.lock().unwrap();
-        conns.retain(|w| w.strong_count() > 0);
-        conns.push(Arc::downgrade(conn));
+    /// Registers a live connection and reports whether the server is ALREADY
+    /// draining. Registration and the drain transition share one lock, so a
+    /// connection is either captured by `begin_drain`'s snapshot or told here
+    /// to drain itself — never missed. (Previously a handshake finishing just
+    /// after the snapshot would send GOAWAY but never be closed, wedging
+    /// shutdown behind an otherwise-idle client that held its socket open.)
+    #[must_use]
+    fn register(&self, conn: &Arc<ServerConn>) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        g.conns.retain(|w| w.strong_count() > 0);
+        g.conns.push(Arc::downgrade(conn));
+        g.draining
     }
 
     /// Sends GOAWAY on every live connection and closes each once its
@@ -362,10 +441,10 @@ impl ServeState {
     /// hyper's graceful shutdown, which does not wait for clients to hang
     /// up on their own.
     fn begin_drain(&self) {
-        self.draining.store(true, Ordering::Release);
         let conns: Vec<_> = {
-            let mut c = self.conns.lock().unwrap();
-            c.drain(..).filter_map(|w| w.upgrade()).collect()
+            let mut g = self.inner.lock().unwrap();
+            g.draining = true;
+            g.conns.drain(..).filter_map(|w| w.upgrade()).collect()
         };
         for conn in conns {
             tokio::spawn(conn.drain_and_close());
@@ -393,6 +472,9 @@ struct ServerConn {
     drained: Notify,
     window: u32,
     max_frame: usize,
+    /// Operator ceiling on concurrent streams (`Server::max_concurrent_streams`);
+    /// `None` is unlimited. Excess opens are refused before any allocation.
+    max_streams: Option<u32>,
     /// Pre-park spin budget (µs) for the demux path.
     spin_us: u32,
     info: ShmscConnectInfo,
@@ -501,12 +583,15 @@ async fn run_conn<S>(
         drained: Notify::new(),
         window: cfg.stream_window,
         max_frame: cfg.max_frame,
+        max_streams: cfg.max_streams,
         spin_us: cfg.spin_us,
         info,
     });
-    state.register(&conn);
-    if state.draining.load(Ordering::Acquire) {
-        conn.send_goaway("server shutting down");
+    if state.register(&conn) {
+        // Registered after the drain began: drain this late connection ourselves
+        // (GOAWAY, then close once its streams finish) so an idle late arrival
+        // cannot wedge graceful shutdown.
+        tokio::spawn(conn.clone().drain_and_close());
     }
 
     {
@@ -595,6 +680,22 @@ where
             if conn.draining.load(Ordering::Acquire) {
                 // Refused before any processing: safe for the client to retry
                 // on a new connection.
+                conn.write.send_ctrl(WriteOp::Frame {
+                    typ: FrameType::RstStream,
+                    flags: 0,
+                    stream_id: id,
+                    payload: frame::encode_rst(RstCode::Refused),
+                });
+                return Ok(());
+            }
+            // Enforce the operator's concurrent-stream ceiling BEFORE allocating
+            // any per-stream state or spawning a handler, so a client cannot
+            // exhaust memory past a configured bound. RST(Refused) is retry-safe.
+            // `active` is incremented only by this single-threaded demux and
+            // decremented by handler completion, so the load is an accurate gate.
+            if let Some(max) = conn.max_streams
+                && conn.active.load(Ordering::Acquire) >= max as usize
+            {
                 conn.write.send_ctrl(WriteOp::Frame {
                     typ: FrameType::RstStream,
                     flags: 0,
@@ -721,7 +822,14 @@ where
             Ok(())
         }
         FrameType::Ping => {
+            frame.validate_ping()?;
             if frame.flags & FLAG_ACK == 0 {
+                // Fail the connection on a PING flood (peer keeps sending while
+                // refusing to drain our outbound ring) instead of pinning an
+                // unbounded queue of acks.
+                if !conn.io.queue_ping_ack() {
+                    return Err(ProtocolError("peer flooded unacknowledged PINGs".into()));
+                }
                 conn.write.send_ctrl(WriteOp::Frame {
                     typ: FrameType::Ping,
                     flags: FLAG_ACK,
@@ -862,4 +970,43 @@ fn status_trailers(status: &Status) -> HeaderMap {
         hm.insert("grpc-status", http::HeaderValue::from_static("13"));
     }
     hm
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Cleanup must remove only the exact socket this listener bound (by
+    /// dev+inode), never a replacement listener's file that rebound the same
+    /// path during a rolling restart — the shutdown-unlink hazard from the
+    /// adversarial review.
+    #[test]
+    fn unlink_if_ours_matches_by_inode() {
+        let path = std::env::temp_dir().join(format!("shmsc-unlink-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Bind a real socket so the path names one; capture its identity.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let ours = sock_ident(&path);
+        assert!(ours.is_some());
+
+        // Simulate a replacement: a different file (different inode) at the path.
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"replacement").unwrap();
+
+        // Cleanup keyed on the OLD identity must NOT delete the replacement.
+        unlink_if_ours(&path, ours);
+        assert!(
+            path.exists(),
+            "must not delete a different inode at the path"
+        );
+
+        // Cleanup keyed on the CURRENT identity removes exactly that file.
+        let cur = sock_ident(&path);
+        unlink_if_ours(&path, cur);
+        assert!(!path.exists(), "must remove the file it identifies");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

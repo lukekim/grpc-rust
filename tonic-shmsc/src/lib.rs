@@ -158,6 +158,8 @@ impl ShmscConfig {
             ring_size: self.ring_size,
             stream_window: self.stream_window,
             max_frame: self.max_frame,
+            // Server-only; set from ServerBuildOptions in the bind path.
+            max_streams: None,
             spin_us: self.spin_us,
         }
     }
@@ -286,6 +288,9 @@ impl ServerTransportBuilder for ShmscServerBuilder {
             if let Some(w) = opts.init_stream_window_size {
                 cfg.stream_window = w;
             }
+            // Honor the operator's concurrent-stream ceiling (previously
+            // dropped): the server refuses excess opens with RST(Refused).
+            cfg.max_streams = opts.max_concurrent_streams;
             let listener = engine::server::ShmscListener::bind(std::path::Path::new(&target), cfg)?;
             Ok(Box::new(ShmscServerTransport { listener }) as Box<dyn ServerTransport>)
         })

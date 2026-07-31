@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
@@ -68,8 +68,6 @@ pub(crate) struct ClientConn {
     /// Peer-granted per-stream window (from the hello), both directions.
     window: u32,
     max_frame: usize,
-    /// Pre-park spin budget (µs) for the demux path.
-    spin_us: u32,
 }
 
 impl std::fmt::Debug for ClientConn {
@@ -117,6 +115,67 @@ impl ClientConn {
 impl Drop for ClientConn {
     fn drop(&mut self) {
         self.io.close(CloseReason::Local);
+    }
+}
+
+/// RAII cleanup for a stream that has been inserted into the table but whose
+/// RPC future may still be dropped before `ShmBody` takes over cancellation —
+/// i.e. while awaiting queue capacity for HEADERS or while awaiting the
+/// response head. On drop while armed it removes the table entry (which aborts
+/// the request pump) and sends RST_STREAM(Cancel) *after* HEADERS, so the
+/// server cancels the stream rather than running an orphaned handler. Disarmed
+/// once the head has arrived and `ShmBody` (streaming) or a clean END_STREAM
+/// (unary) owns cancellation.
+struct PendingStreamGuard {
+    conn: Arc<ClientConn>,
+    id: u32,
+    armed: bool,
+}
+
+impl PendingStreamGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingStreamGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let conn = self.conn.clone();
+        let id = self.id;
+        // Drop cannot await, and the RST must follow HEADERS on the *ordered*
+        // data queue: a control-queue RST could overtake a still-queued HEADERS
+        // and reach the server first, which would then open and orphan the
+        // handler. So run the ordered cleanup on a detached task; fall back to
+        // the priority queue only if there is no runtime to spawn on.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    conn.remove_entry(id);
+                    let _ = conn
+                        .write
+                        .data_tx
+                        .send(WriteOp::Frame {
+                            typ: FrameType::RstStream,
+                            flags: 0,
+                            stream_id: id,
+                            payload: frame::encode_rst(RstCode::Cancel),
+                        })
+                        .await;
+                });
+            }
+            Err(_) => {
+                conn.remove_entry(id);
+                conn.write.send_ctrl(WriteOp::Frame {
+                    typ: FrameType::RstStream,
+                    flags: 0,
+                    stream_id: id,
+                    payload: frame::encode_rst(RstCode::Cancel),
+                });
+            }
+        }
     }
 }
 
@@ -190,7 +249,6 @@ pub(crate) async fn connect(path: &std::path::Path, cfg: Config) -> io::Result<S
         draining: AtomicBool::new(false),
         window: hello.stream_window,
         max_frame: cfg.max_frame,
-        spin_us: cfg.spin_us,
     });
 
     // Doorbell task.
@@ -212,12 +270,20 @@ pub(crate) async fn connect(path: &std::path::Path, cfg: Config) -> io::Result<S
             drop(seg);
         });
     }
-    // Demux task.
+    // Demux task. It holds only a *weak* reference to the connection: the
+    // externally owned lifetime is the channel handle plus any in-flight RPC
+    // (call future, request pump, live response body). When all of those drop,
+    // `ClientConn::drop` runs `io.close`, which wakes this loop — otherwise a
+    // demux parked waiting for peer traffic would pin the connection (socket,
+    // mapping, writer/doorbell tasks, and the server-side peer) forever after
+    // the user is done with it.
     {
-        let conn = conn.clone();
+        let weak = Arc::downgrade(&conn);
+        let io = io.clone();
         let seg = seg.clone();
+        let spin_us = cfg.spin_us;
         tokio::spawn(async move {
-            demux_loop(conn, consumer).await;
+            demux_loop(weak, io, consumer, spin_us).await;
             drop(seg);
         });
     }
@@ -225,14 +291,19 @@ pub(crate) async fn connect(path: &std::path::Path, cfg: Config) -> io::Result<S
     Ok(ShmscChannel { conn })
 }
 
-async fn demux_loop(conn: Arc<ClientConn>, mut consumer: Consumer) {
-    let io = conn.io.clone();
+async fn demux_loop(conn: Weak<ClientConn>, io: Arc<ConnIo>, mut consumer: Consumer, spin_us: u32) {
     let mut bell = io.bell();
-    let mut spin = SpinBudget::new(conn.spin_us);
+    let mut spin = SpinBudget::new(spin_us);
     let mut arena = BytesMut::new();
     let reason = loop {
         match read_frame(&mut consumer, &mut bell, &io, &mut spin, &mut arena).await {
             Ok(frame) => {
+                // Upgrade per frame: once every external owner has dropped there
+                // is nothing left to dispatch to, so close and stop.
+                let Some(conn) = conn.upgrade() else {
+                    io.close(CloseReason::Local);
+                    break io.close_reason();
+                };
                 if let Err(e) = handle_frame(&conn, frame) {
                     io.close(CloseReason::Protocol(e.0));
                     break io.close_reason();
@@ -241,7 +312,9 @@ async fn demux_loop(conn: Arc<ClientConn>, mut consumer: Consumer) {
             Err(reason) => break reason,
         }
     };
-    conn.fail_all(&ClientConn::status_for_close(&reason));
+    if let Some(conn) = conn.upgrade() {
+        conn.fail_all(&ClientConn::status_for_close(&reason));
+    }
 }
 
 fn handle_frame(conn: &Arc<ClientConn>, frame: Frame) -> Result<(), ProtocolError> {
@@ -355,7 +428,14 @@ fn handle_frame(conn: &Arc<ClientConn>, frame: Frame) -> Result<(), ProtocolErro
             Ok(())
         }
         FrameType::Ping => {
+            frame.validate_ping()?;
             if frame.flags & FLAG_ACK == 0 {
+                // Fail the connection on a PING flood (peer keeps sending while
+                // refusing to drain our outbound ring) instead of pinning an
+                // unbounded queue of acks.
+                if !conn.io.queue_ping_ack() {
+                    return Err(ProtocolError("peer flooded unacknowledged PINGs".into()));
+                }
                 conn.write.send_ctrl(WriteOp::Frame {
                     typ: FrameType::Ping,
                     flags: FLAG_ACK,
@@ -434,7 +514,7 @@ async fn call_inner(
     // HTTP/2, rejects a non-increasing id). Only stream OPENS serialize here;
     // the writer task drains the queue independently, so this cannot
     // deadlock against a full queue.
-    let (id, credit, window) = {
+    let (id, credit, window, mut guard) = {
         let _open = conn.open_mu.lock().await;
         let id = conn.next_id.fetch_add(2, Ordering::AcqRel);
         if id > MAX_STREAM_ID {
@@ -458,8 +538,17 @@ async fn call_inner(
                 },
             );
         }
+        // Arm cleanup now: from here until the response head arrives, dropping
+        // this future (deadline/cancel) must remove the entry, abort the pump,
+        // and RST the stream so the server does not run an orphaned handler.
+        let mut guard = PendingStreamGuard {
+            conn: conn.clone(),
+            id,
+            armed: true,
+        };
         // HEADERS first (FIFO with this stream's DATA); the request pump is
-        // spawned after the lock drops.
+        // spawned after the lock drops. Dropping the future during this await
+        // (queue full) triggers the guard.
         if conn
             .write
             .data_tx
@@ -472,12 +561,15 @@ async fn call_inner(
             .await
             .is_err()
         {
+            // HEADERS never reached the wire and the connection is gone, so the
+            // guard's ordered RST would be pointless; clean up directly.
+            guard.disarm();
             conn.remove_entry(id);
             return Err(Box::new(ClientConn::status_for_close(
                 &conn.io.close_reason(),
             )));
         }
-        (id, credit, window)
+        (id, credit, window, guard)
     };
 
     let pump = tokio::spawn(pump_request_body(conn.clone(), id, body, window));
@@ -488,17 +580,22 @@ async fn call_inner(
         pump.abort();
     }
 
-    // Await the response head.
+    // Await the response head. Until it arrives the guard stays armed, so a
+    // dropped or timed-out call future is cleaned up and the stream is RST.
     let head = match resp_rx.await {
         Ok(Ok(head)) => head,
+        // Server error/RST (entry already removed by the demux) or a closed
+        // connection: the still-armed guard cleans up on drop.
         Ok(Err(status)) => return Err(Box::new(status)),
         Err(_) => {
-            conn.remove_entry(id);
             return Err(Box::new(ClientConn::status_for_close(
                 &conn.io.close_reason(),
             )));
         }
     };
+    // Head received: ShmBody (streaming) or a clean END_STREAM (unary) now owns
+    // cancellation, so stand the pre-header guard down.
+    guard.disarm();
 
     let body = if head.end_stream {
         Body::new(ShmBody::empty(body_rx, credit))
