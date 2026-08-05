@@ -114,6 +114,8 @@
 
 #[cfg(feature = "channel")]
 pub mod channel;
+#[cfg(any(feature = "channel", all(feature = "server", feature = "router")))]
+pub mod experimental;
 #[cfg(feature = "server")]
 pub mod server;
 

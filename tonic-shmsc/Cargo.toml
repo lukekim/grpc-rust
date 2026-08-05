@@ -1,0 +1,63 @@
+[package]
+name = "tonic-shmsc"
+# When releasing to crates.io:
+# - Remove path dependencies
+# - Update CHANGELOG.md.
+authors = ["gRPC authors"]
+categories = ["network-programming", "asynchronous"]
+description = """
+A self-contained, experimental shared-memory (SHM) transport plugin for tonic,
+implemented entirely against tonic's public experimental pluggable-transport API.
+"""
+edition = "2024"
+homepage = "https://github.com/hyperium/tonic"
+keywords = ["rpc", "grpc", "async", "shared-memory", "ipc"]
+license = "MIT"
+repository = "https://github.com/hyperium/tonic"
+version = "0.1.0"
+rust-version = { workspace = true }
+publish = false
+
+[features]
+# Test-only: exposes a raw hostile-peer helper for conformance tests. Never
+# enable in a normal build.
+_test-support = []
+
+[dependencies]
+# The self-containment proof: this crate drives gRPC through tonic's PUBLIC
+# experimental transport API only. It deliberately does NOT depend on hyper or
+# h2 — the engine owns framing and flow control (see the guard test).
+tonic = { path = "../tonic", default-features = false, features = ["channel", "server", "router"] }
+
+bytes = "1.0"
+http = "1.1.0"
+http-body = "1"
+tokio = { version = "1", default-features = false, features = ["net", "rt", "sync", "io-util", "time", "macros"] }
+tower-service = "0.3"
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+] }
+
+[dev-dependencies]
+cargo_metadata = "0.19"
+hyper-util = { version = "0.1.11", features = ["tokio"] }
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { path = "../tonic", features = ["router", "transport", "codegen"] }
+tonic-prost = { path = "../tonic-prost" }
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+tonic-prost-build = { path = "../tonic-prost-build" }
+
+[lints]
+workspace = true

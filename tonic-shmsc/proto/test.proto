@@ -1,0 +1,26 @@
+// Test service for the shmsc end-to-end suite.
+syntax = "proto3";
+
+package shmsc.test;
+
+service Echo {
+  // Unary echo.
+  rpc UnaryEcho(EchoRequest) returns (EchoResponse);
+  // Server-streaming: repeats the message `repeat` times.
+  rpc ServerStreamingEcho(EchoRequest) returns (stream EchoResponse);
+  // Client-streaming: concatenates the received messages.
+  rpc ClientStreamingEcho(stream EchoRequest) returns (EchoResponse);
+  // Bidirectional echo.
+  rpc BidiEcho(stream EchoRequest) returns (stream EchoResponse);
+}
+
+message EchoRequest {
+  bytes payload = 1;
+  uint32 repeat = 2;
+  // When set, the server responds with this gRPC status code instead.
+  int32 fail_with_code = 3;
+}
+
+message EchoResponse {
+  bytes payload = 1;
+}

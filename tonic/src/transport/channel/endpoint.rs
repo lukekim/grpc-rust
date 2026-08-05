@@ -80,6 +80,7 @@ pub struct Endpoint {
     pub(crate) http2_adaptive_window: Option<bool>,
     pub(crate) local_address: Option<IpAddr>,
     pub(crate) executor: SharedExec,
+    pub(crate) transport_type: Option<String>,
 }
 
 impl Endpoint {
@@ -129,6 +130,7 @@ impl Endpoint {
             http2_adaptive_window: None,
             executor: SharedExec::tokio(),
             local_address: None,
+            transport_type: None,
         }
     }
 
@@ -160,6 +162,7 @@ impl Endpoint {
             http2_adaptive_window: None,
             executor: SharedExec::tokio(),
             local_address: None,
+            transport_type: None,
         }
     }
 
@@ -579,6 +582,9 @@ impl Endpoint {
 
     /// Create a channel from this config.
     pub async fn connect(&self) -> Result<Channel, Error> {
+        if self.transport_type.is_some() {
+            return Channel::connect_custom(self.clone()).await;
+        }
         match &self.uri {
             EndpointType::Uri(_) => Channel::connect(self.http_connector(), self.clone()).await,
             EndpointType::Uds(uds_filepath) => {
@@ -592,6 +598,9 @@ impl Endpoint {
     /// The channel returned by this method does not attempt to connect to the endpoint until first
     /// use.
     pub fn connect_lazy(&self) -> Channel {
+        if self.transport_type.is_some() {
+            return Channel::custom_lazy(self.clone());
+        }
         match &self.uri {
             EndpointType::Uri(_) => Channel::new(self.http_connector(), self.clone()),
             EndpointType::Uds(uds_filepath) => {
@@ -614,6 +623,12 @@ impl Endpoint {
         C::Future: Send,
         crate::BoxError: From<C::Error> + Send,
     {
+        // An explicitly selected transport type always wins: honoring the
+        // connector here would silently serve a different protocol than the
+        // one selected, which fail-closed selection forbids.
+        if self.transport_type.is_some() {
+            return Channel::connect_custom(self.clone()).await;
+        }
         let connector = self.connector(connector);
 
         if let Some(connect_timeout) = self.connect_timeout {
@@ -639,6 +654,10 @@ impl Endpoint {
         C::Future: Send,
         crate::BoxError: From<C::Error> + Send,
     {
+        // See connect_with_connector: transport_type takes precedence.
+        if self.transport_type.is_some() {
+            return Channel::custom_lazy(self.clone());
+        }
         let connector = self.connector(connector);
         if let Some(connect_timeout) = self.connect_timeout {
             let mut connector = hyper_timeout::TimeoutConnector::new(connector);
@@ -646,6 +665,64 @@ impl Endpoint {
             Channel::new(connector, self.clone())
         } else {
             Channel::new(connector, self.clone())
+        }
+    }
+
+    /// Select an EXPERIMENTAL pluggable transport for this endpoint by
+    /// registered type name (see [`transport::experimental`]).
+    ///
+    /// Connections for this endpoint are then built by the
+    /// [`ClientTransportBuilder`] registered under `name` instead of the
+    /// default HTTP/2 stack. Selection is fail-closed: if no builder is
+    /// registered under `name`, connecting is a hard error — never a silent
+    /// fallback to HTTP/2 — and an explicitly provided connector
+    /// (`connect_with_connector`) is also overridden rather than silently
+    /// changing the selected protocol.
+    ///
+    /// Per-endpoint behavior above the transport seam — origin, user agent,
+    /// request timeout, concurrency and rate limits, and reconnects — still
+    /// applies.
+    ///
+    /// # Stability
+    ///
+    /// EXPERIMENTAL: this method and the semantics of transport types may
+    /// change or be removed without a major version bump.
+    ///
+    /// [`transport::experimental`]: crate::transport::experimental
+    /// [`ClientTransportBuilder`]: crate::transport::experimental::client::ClientTransportBuilder
+    pub fn transport_type(self, name: impl Into<String>) -> Self {
+        Endpoint {
+            transport_type: Some(name.into()),
+            ..self
+        }
+    }
+
+    /// Get the EXPERIMENTAL pluggable transport type selected for this
+    /// endpoint, if any. See [`Endpoint::transport_type`].
+    pub fn get_transport_type(&self) -> Option<&str> {
+        self.transport_type.as_deref()
+    }
+
+    /// The purpose-built options handed to an experimental client transport
+    /// builder for this endpoint.
+    pub(crate) fn experimental_build_options(
+        &self,
+    ) -> crate::transport::experimental::client::ClientBuildOptions {
+        crate::transport::experimental::client::ClientBuildOptions {
+            user_agent: self.user_agent.clone(),
+            connect_timeout: self.connect_timeout,
+            init_stream_window_size: self.init_stream_window_size,
+            init_connection_window_size: self.init_connection_window_size,
+            tls_configured: {
+                #[cfg(feature = "_tls-any")]
+                {
+                    self.tls.is_some()
+                }
+                #[cfg(not(feature = "_tls-any"))]
+                {
+                    false
+                }
+            },
         }
     }
 
